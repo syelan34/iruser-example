@@ -3,7 +3,6 @@
 
 #include <3ds.h>
 #include <malloc.h>
-#include "iruser.h"
 
 // disable ir:rst since it overrides ir:user
 bool hidShouldUseIrrst(void) { return false; }
@@ -20,7 +19,6 @@ static u32* iruserSharedMem;
 static u32 iruserSharedMemSize;
 static Handle connectionStatusEvent;
 static Handle receivePacketEvent;
-static bool CPPConnected;
 
 
 size_t round_up(size_t value, size_t multiple) {
@@ -36,14 +34,41 @@ void waitForInput(u32 key) {
 	}
 }
 
-Result attemptConnectCirclePadPro() {
+IRUSER_ConnectionStatus checkConnectionStatus() {
+    IRUSER_ConnectionStatus status;
+    // even though we're using shared memory, this command still works
+    Result res = IRUSER_GetConnectionStatus(&status);
+    if (R_FAILED(res)) {printf("IRUSER_GetConnectionStatus() failed: %08x\n", (unsigned int)res);return res;}
+    printf("Connection status is %u\n", status);
+    return status;
+}
+
+bool attemptConnectCirclePadPro() {
+    printf("Attempting to connect...\n");
+    // only errors if already connected/connecting
     Result res = IRUSER_RequireConnection(CPP_DEVICE_ID);
-    if (R_FAILED(res)) return res;
-    res = iruserCPPRequestInputPolling(CPP_CONNECTION_POLLING_PERIOD_MS);
-    if (R_FAILED(res)) return res;
-    res = svcWaitSynchronization(receivePacketEvent, 100000); // wait for 100ms for a response
-    CPPConnected = R_SUCCEEDED(res);
-    return res;
+    if (R_FAILED(res)) {printf("IRUSER_RequireConnection() failed: %08x\n", (unsigned int)res);return res;}
+    // wait for connection status to change
+    res = svcWaitSynchronization(connectionStatusEvent, 100000000); // wait for 100ms for a response
+    if (R_FAILED(res) && R_DESCRIPTION(res) != RD_TIMEOUT) {
+        printf("svcWaitSynchronization() failed: %08x\n", (unsigned int)res);
+        return res;
+    }
+    // check if connected
+    if (checkConnectionStatus() == CNSTATUS_Connected) {
+        printf("Circle Pad Pro connected successfully.\n");
+        return true;
+    }
+    printf("Connection failed. Disconnecting...\n");
+    res = IRUSER_Disconnect();
+    if (R_FAILED(res)) {printf("IRUSER_Disconnect() failed: %08x\n", (unsigned int)res);return res;}
+    // wait for connection status to change
+    res = svcWaitSynchronization(connectionStatusEvent, 100000000); // wait for 100ms for a response
+    if (R_FAILED(res) && R_DESCRIPTION(res) != RD_TIMEOUT) {
+        printf("svcWaitSynchronization() failed: %08x\n", (unsigned int)res);
+        return res;
+    }
+    return false;
 }
 
 Result iruser_test()
@@ -53,22 +78,29 @@ Result iruser_test()
 	printf("IR:USER initialized successfully, looking for Circle Pad Pro...\n");
 
 	tryconnect:
-	if (R_FAILED(ret = attemptConnectCirclePadPro())) {
-	    printf("Connection failed.\n");
-		printf("Press B to stop trying or A to try again.\n");
+	if (!attemptConnectCirclePadPro()) {
+		printf("Press B to stop trying\nPress A to try again.\nPress Y to check connection status.\n");
 	    while(1) {
 			gspWaitForVBlank();
 			hidScanInput();
 			u32 kDown = hidKeysDown();
 			
 			if (kDown & KEY_A) goto tryconnect;
-			if (kDown & KEY_B) return ret;
+			
+			if (kDown & KEY_B) return MAKERESULT(RL_SUCCESS, RS_CANCELED, RM_COMMON, RD_CANCEL_REQUESTED);
+			if (kDown & KEY_Y) {
+                IRUSER_ConnectionStatus status;
+                checkConnectionStatus(&status);
+            }
 		}
 	}
 	
-	printf("Circle Pad Pro connected successfully.");
+	// Circle Pad Pro connected, start polling
+	ret=iruserCPPRequestInputPolling(CPP_CONNECTION_POLLING_PERIOD_MS);
+	if (R_FAILED(ret)) {printf("iruserCPPRequestInputPolling() failed: %08x\n", (unsigned int)ret);return ret;}
 
 	printf("Press B to exit or Y to reconnect.\n");
+	printf("Press A to display connection status or X to display connection role.\n");
 
 	u32 kDown;
 	circlePadProInputResponse state;
@@ -80,6 +112,18 @@ Result iruser_test()
 		kDown = hidKeysDown();
 
 		if(kDown & KEY_B) break;
+		if (kDown & KEY_A) {
+            IRUSER_ConnectionStatus status;
+            ret = IRUSER_GetConnectionStatus(&status);
+            if (R_FAILED(ret)) {printf("IRUSER_GetConnectionStatus() failed: %08x\n", (unsigned int)ret);return ret;}
+            printf("Connection status is %u\n", status);
+        }
+		if (kDown & KEY_X) {
+                IRUSER_ConnectionRole role;
+                ret = IRUSER_GetConnectionRole(&role);
+                if (R_FAILED(ret)) {printf("IRUSER_GetConnectionRole() failed: %08x\n", (unsigned int)ret);return ret;}
+                printf("Connection role is %u\n", role);
+            }
 
 		if(kDown & KEY_Y)//If you want this to be done automatically, you could run this when the ConnectionStatus changes to Disconnected.
 		{
@@ -94,7 +138,7 @@ Result iruser_test()
 			continue;
 		}
 
-		if (CPPConnected) ret = iruserGetCirclePadProState(&state);
+		if (checkConnectionStatus() == CNSTATUS_Connected) ret = iruserGetCirclePadProState(&state);
 		
 		printf("dx:%04x dy:%04x bat:%04x btn:%03x unk:%02x\n", state.cstick.csPos.dx, state.cstick.csPos.dy, state.status.battery_level, state.status_raw >> 5, state.unknown_field);
 	}
