@@ -35,38 +35,51 @@ void waitForInput(u32 key) {
 }
 
 IRUSER_ConnectionStatus checkConnectionStatus() {
-    IRUSER_ConnectionStatus status;
-    // even though we're using shared memory, this command still works
-    Result res = IRUSER_GetConnectionStatus(&status);
-    if (R_FAILED(res)) {printf("IRUSER_GetConnectionStatus() failed: %08x\n", (unsigned int)res);return res;}
-    printf("Connection status is %u\n", status);
-    return status;
+    IRUSER_StatusInfo statusInfo = iruserGetStatusInfo();
+    
+    return statusInfo.connection_status;
 }
 
+void printStatusInfo() {
+    IRUSER_StatusInfo statusInfo = iruserGetStatusInfo();
+    
+    printf("recv err result: %08lx\n", statusInfo.recv_err_result);
+    printf("send err result: %08lx\n", statusInfo.send_err_result);
+    printf("connection status: %u\n", statusInfo.connection_status);
+    printf("trying to connect status: %02x\n", statusInfo.trying_to_connect_status);
+    printf("connection role: %02x\n", statusInfo.connection_role);
+    printf("machine id: %02x\n", statusInfo.machine_id);
+    printf("target machine id: %02x\n", statusInfo.target_machine_id);
+    printf("network id: %02x\n", statusInfo.network_id);
+    printf("unknown field 2: %02x\n", statusInfo.unknown_field_2);
+    printf("unknown field 3: %02x\n", statusInfo.unknown_field_3);
+}
+
+#define SYNC_WAIT_TIMEOUT 100000000 // 100ms
+
 bool attemptConnectCirclePadPro() {
-    printf("Attempting to connect...\n");
     // only errors if already connected/connecting
     Result res = IRUSER_RequireConnection(CPP_DEVICE_ID);
-    if (R_FAILED(res)) {printf("IRUSER_RequireConnection() failed: %08x\n", (unsigned int)res);return res;}
+    if (R_FAILED(res)) {printf("IRUSER_RequireConnection() failed: %08x\n", (unsigned int)res);return false;}
     // wait for connection status to change
-    res = svcWaitSynchronization(connectionStatusEvent, 100000000); // wait for 100ms for a response
+    res = svcWaitSynchronization(connectionStatusEvent, SYNC_WAIT_TIMEOUT); // wait for 100ms for a response
     if (R_FAILED(res) && R_DESCRIPTION(res) != RD_TIMEOUT) {
         printf("svcWaitSynchronization() failed: %08x\n", (unsigned int)res);
         return res;
     }
+    
     // check if connected
     if (checkConnectionStatus() == CNSTATUS_Connected) {
         printf("Circle Pad Pro connected successfully.\n");
         return true;
     }
-    printf("Connection failed. Disconnecting...\n");
     res = IRUSER_Disconnect();
-    if (R_FAILED(res)) {printf("IRUSER_Disconnect() failed: %08x\n", (unsigned int)res);return res;}
+    if (R_FAILED(res)) {printf("IRUSER_Disconnect() failed: %08x\n", (unsigned int)res);return false;}
     // wait for connection status to change
-    res = svcWaitSynchronization(connectionStatusEvent, 100000000); // wait for 100ms for a response
+    res = svcWaitSynchronization(connectionStatusEvent, SYNC_WAIT_TIMEOUT); // wait for 100ms for a response
     if (R_FAILED(res) && R_DESCRIPTION(res) != RD_TIMEOUT) {
         printf("svcWaitSynchronization() failed: %08x\n", (unsigned int)res);
-        return res;
+        return false;
     }
     return false;
 }
@@ -78,28 +91,21 @@ Result iruser_test()
 	printf("IR:USER initialized successfully, looking for Circle Pad Pro...\n");
 
 	tryconnect:
-	if (!attemptConnectCirclePadPro()) {
-		printf("Press B to stop trying\nPress A to try again.\nPress Y to check connection status.\n");
-	    while(1) {
-			gspWaitForVBlank();
-			hidScanInput();
-			u32 kDown = hidKeysDown();
-			
-			if (kDown & KEY_A) goto tryconnect;
-			
-			if (kDown & KEY_B) return MAKERESULT(RL_SUCCESS, RS_CANCELED, RM_COMMON, RD_CANCEL_REQUESTED);
-			if (kDown & KEY_Y) {
-                IRUSER_ConnectionStatus status;
-                checkConnectionStatus(&status);
-            }
-		}
+	printf("Press B to cancel.\n");
+	while (!attemptConnectCirclePadPro()) {
+		gspWaitForVBlank();
+		hidScanInput();
+		u32 kDown = hidKeysDown();
+		
+		if (kDown & KEY_B) return MAKERESULT(RL_SUCCESS, RS_CANCELED, RM_COMMON, RD_CANCEL_REQUESTED);
 	}
 	
 	// Circle Pad Pro connected, start polling
 	ret=iruserCPPRequestInputPolling(CPP_CONNECTION_POLLING_PERIOD_MS);
+	
 	if (R_FAILED(ret)) {printf("iruserCPPRequestInputPolling() failed: %08x\n", (unsigned int)ret);return ret;}
 
-	printf("Press B to exit or Y to reconnect.\n");
+	printf("Press B to exit.\n");
 	printf("Press A to display connection status or X to display connection role.\n");
 
 	u32 kDown;
@@ -119,28 +125,21 @@ Result iruser_test()
             printf("Connection status is %u\n", status);
         }
 		if (kDown & KEY_X) {
-                IRUSER_ConnectionRole role;
-                ret = IRUSER_GetConnectionRole(&role);
-                if (R_FAILED(ret)) {printf("IRUSER_GetConnectionRole() failed: %08x\n", (unsigned int)ret);return ret;}
-                printf("Connection role is %u\n", role);
-            }
-
-		if(kDown & KEY_Y)//If you want this to be done automatically, you could run this when the ConnectionStatus changes to Disconnected.
-		{
-			printf("Restarting scanning...\n");
-
-			ret = attemptConnectCirclePadPro();
-			if(R_FAILED(ret))
-				printf("attemptConnectCirclePadPro()  failed: 0x%08x.\n", (unsigned int)ret);
-			else
-			    printf("Scanning restarted.\n");
-
-			continue;
-		}
+            IRUSER_ConnectionRole role;
+            ret = IRUSER_GetConnectionRole(&role);
+            if (R_FAILED(ret)) {printf("IRUSER_GetConnectionRole() failed: %08x\n", (unsigned int)ret);return ret;}
+            printf("Connection role is %u.\n", role);
+        }
 
 		if (checkConnectionStatus() == CNSTATUS_Connected) ret = iruserGetCirclePadProState(&state);
 		
-		printf("dx:%04x dy:%04x bat:%04x btn:%03x unk:%02x\n", state.cstick.csPos.dx, state.cstick.csPos.dy, state.status.battery_level, state.status_raw >> 5, state.unknown_field);
+		if (checkConnectionStatus() == CNSTATUS_Disconnected) {
+		    printf("Disconnected from Circle Pad Pro.\n");
+			printf("Attempting to reconnect...\n");
+			goto tryconnect;
+		}
+		
+		printf("\e[s\e[30;1Hdx:%04x dy:%04x bat:%04x btn:%03x unk:%02x\e[u", state.cstick.csPos.dx, state.cstick.csPos.dy, state.status.battery_level, state.status_raw >> 5, state.unknown_field);
 	}
 
 	return ret;
